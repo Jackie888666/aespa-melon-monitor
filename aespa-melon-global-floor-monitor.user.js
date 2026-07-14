@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         aespa 8/7 Melon Global 内场回流票监控（iPad/Gear）
 // @namespace    https://chatgpt.com/
-// @version      1.1.2
+// @version      1.1.3
 // @description  iPad Gear Browser / Tampermonkey 兼容。只读监控 2026-08-07 aespa 首尔场（prodId=213414）的 F1-F16 内场回流票，并通过 Bark 提醒；不自动选座或下单。
 // @author       OpenAI
 // @homepageURL  https://github.com/Jackie888666/aespa-melon-monitor
@@ -56,6 +56,7 @@
   let lastAvailabilitySignature = "";
   let lastSeenAt = "尚未检查";
   let statusElement = null;
+  let quickSettingsElement = null;
   const isPerformancePage = location.pathname.includes("/performance/");
   let currentStatus = isPerformancePage
     ? {
@@ -673,30 +674,78 @@
     );
   }
 
+  function closeQuickSettings() {
+    quickSettingsElement?.remove();
+    quickSettingsElement = null;
+  }
+
   function openQuickSettings() {
-    const choice = window.prompt(
-      [
-        "aespa 回流票监控设置",
-        "1 — 设置 Bark 地址",
-        "2 — 测试 Bark 推送",
-        "3 — 设置内场分区",
-        "4 — 设置检查间隔",
-        "5 — 查看监控状态",
-        "请输入 1-5：",
-      ].join("\n"),
-      "1",
-    );
-    if (choice == null) return;
-    const actions = {
-      1: setBarkAddress,
-      2: testBarkPush,
-      3: setFloorSections,
-      4: setPollingInterval,
-      5: showMonitorStatus,
-    };
-    const action = actions[String(choice).trim()];
-    if (action) action();
-    else window.alert("请输入 1、2、3、4 或 5。");
+    if (quickSettingsElement) {
+      closeQuickSettings();
+      return;
+    }
+
+    const overlay = document.createElement("div");
+    overlay.id = "aespa-melon-monitor-settings";
+    overlay.style.cssText = [
+      "position:fixed",
+      "inset:0",
+      "z-index:2147483647",
+      "display:flex",
+      "align-items:center",
+      "justify-content:center",
+      "padding:20px",
+      "background:rgba(0,0,0,.52)",
+      "font:15px/1.45 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+    ].join(";");
+    overlay.innerHTML = `
+      <div style="width:min(360px,100%);padding:18px;border-radius:14px;background:#fff;
+                  color:#172033;box-shadow:0 16px 45px rgba(0,0,0,.35)">
+        <strong style="display:block;margin-bottom:4px;font-size:17px">aespa 回流票监控</strong>
+        <div style="margin-bottom:14px;color:#5b6473;font-size:13px">请选择操作，不需要再输入 1–5。</div>
+        <div style="display:grid;gap:9px">
+          <button type="button" data-action="bark">设置 Bark 地址</button>
+          <button type="button" data-action="test">测试 Bark 推送</button>
+          <button type="button" data-action="sections">设置内场分区</button>
+          <button type="button" data-action="interval">设置检查间隔</button>
+          <button type="button" data-action="status">查看监控状态</button>
+          <button type="button" data-action="close">关闭</button>
+        </div>
+      </div>`;
+
+    for (const button of overlay.querySelectorAll("button[data-action]")) {
+      button.style.cssText = [
+        "width:100%",
+        "padding:10px 12px",
+        "border:1px solid #d6dae3",
+        "border-radius:9px",
+        "background:#f7f8fb",
+        "color:#172033",
+        "font:600 15px/1.25 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+      ].join(";");
+    }
+
+    overlay.addEventListener("click", (event) => {
+      if (event.target === overlay) {
+        closeQuickSettings();
+        return;
+      }
+      const button = event.target.closest?.("button[data-action]");
+      if (!button) return;
+      const actions = {
+        bark: setBarkAddress,
+        test: testBarkPush,
+        sections: setFloorSections,
+        interval: setPollingInterval,
+        status: showMonitorStatus,
+      };
+      const actionName = button.dataset.action;
+      closeQuickSettings();
+      if (actionName !== "close") actions[actionName]?.();
+    });
+
+    document.body.appendChild(overlay);
+    quickSettingsElement = overlay;
   }
 
   function registerMenus() {
