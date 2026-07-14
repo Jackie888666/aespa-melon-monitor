@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         aespa 8/7 Melon Global 内场回流票监控（iPad/Gear）
 // @namespace    https://chatgpt.com/
-// @version      1.2.0
+// @version      1.2.1
 // @description  iPad Gear Browser / Tampermonkey 兼容。通过 Fetch、XHR、JSONP 与资源回溯只读监控 2026-08-07 aespa 首尔场（prodId=213414）的 F1-F16 内场回流票，并通过 Bark 提醒；不自动选座或下单。
 // @author       OpenAI
 // @homepageURL  https://github.com/Jackie888666/aespa-melon-monitor
@@ -62,6 +62,7 @@
   let quickSettingsElement = null;
   let lastObservedSummaryUrl = "";
   let lastCaptureSource = "尚未捕获";
+  let lastPayloadShape = "尚未读取";
   let resourcePerformanceObserver = null;
   let resourceMutationObserver = null;
   const seenTicketApiPaths = new Set();
@@ -381,24 +382,126 @@
     }
   }
 
-  function findSummaryArray(value, depth = 0) {
-    if (depth > 6 || value == null || typeof value !== "object") return null;
-    if (Array.isArray(value.summary)) return value.summary;
-    for (const child of Object.values(value)) {
-      const found = findSummaryArray(child, depth + 1);
+  function looksLikeSummaryItem(item) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+    const keys = new Set(
+      Object.keys(item).map((key) => String(key).replace(/[^a-z0-9]/gi, "").toLowerCase()),
+    );
+    const hasCount = [
+      "realseatcntlk",
+      "realseatcnt",
+      "remainseatcnt",
+      "seatcnt",
+      "seatcount",
+      "remaincnt",
+      "availableseatcount",
+    ].some((key) => keys.has(key));
+    const hasSection = [
+      "areaname",
+      "areanm",
+      "blockname",
+      "blocknm",
+      "sectionname",
+      "sectionnm",
+      "floorname",
+      "areano",
+      "floorno",
+    ].some((key) => keys.has(key));
+    return hasCount || hasSection;
+  }
+
+  function findSummaryArray(value, depth = 0, keyHint = "root") {
+    if (depth > 8 || value == null || typeof value !== "object") return null;
+
+    if (Array.isArray(value)) {
+      if (
+        depth === 0 ||
+        value.length === 0 ||
+        value.some((item) => looksLikeSummaryItem(item)) ||
+        /summary|block|seat|area|floor|list|data/i.test(keyHint)
+      ) {
+        return value;
+      }
+      for (const child of value) {
+        const found = findSummaryArray(child, depth + 1, keyHint);
+        if (found) return found;
+      }
+      return null;
+    }
+
+    const preferredKeys = [
+      "summary",
+      "summaryList",
+      "blockSummary",
+      "blockSummaryList",
+      "seatSummary",
+      "seatSummaryList",
+      "remainSeatList",
+      "data",
+      "list",
+      "result",
+    ];
+    for (const key of preferredKeys) {
+      if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+      const child = value[key];
+      if (Array.isArray(child)) return child;
+      if (child == null && /summary|list/i.test(key)) return [];
+      const found = findSummaryArray(child, depth + 1, key);
       if (found) return found;
+    }
+
+    for (const [key, child] of Object.entries(value)) {
+      if (Array.isArray(child)) {
+        if (
+          child.length === 0 ||
+          child.some((item) => looksLikeSummaryItem(item)) ||
+          /summary|block|seat|area|floor/i.test(key)
+        ) {
+          return child;
+        }
+      }
+      const found = findSummaryArray(child, depth + 1, key);
+      if (found) return found;
+    }
+
+    const objectValues = Object.values(value);
+    if (objectValues.length && objectValues.some((item) => looksLikeSummaryItem(item))) {
+      return objectValues;
     }
     return null;
   }
 
+  function describePayloadShape(value) {
+    if (Array.isArray(value)) return `数组(${value.length})`;
+    if (!value || typeof value !== "object") return typeof value;
+    const keys = Object.keys(value).slice(0, 8);
+    return keys.length ? `字段:${keys.join(",")}` : "空对象";
+  }
+
+  function itemValue(item, names) {
+    for (const name of names) {
+      if (item[name] != null) return item[name];
+    }
+    const loweredNames = names.map((name) =>
+      String(name).replace(/[^a-z0-9]/gi, "").toLowerCase(),
+    );
+    for (const key in item) {
+      const normalizedKey = String(key).replace(/[^a-z0-9]/gi, "").toLowerCase();
+      if (loweredNames.includes(normalizedKey) && item[key] != null) {
+        return item[key];
+      }
+    }
+    return undefined;
+  }
+
   function matchingSectionName(item, allowedSections) {
     const candidates = [
-      item.areaName,
-      item.blockName,
-      item.sectionName,
-      item.floorName,
-      item.areaNo,
-      item.floorNo,
+      itemValue(item, ["areaName", "areaNm"]),
+      itemValue(item, ["blockName", "blockNm"]),
+      itemValue(item, ["sectionName", "sectionNm"]),
+      itemValue(item, ["floorName", "floorNm"]),
+      itemValue(item, ["areaNo"]),
+      itemValue(item, ["floorNo"]),
     ];
     for (const candidate of candidates) {
       const normalized = normalizeSection(candidate);
@@ -409,20 +512,26 @@
 
   function floorAvailability(summary) {
     const allowedSections = configuredSections();
-    const totals = new Map();
+    const totals = [];
     for (const item of summary) {
       if (!item || typeof item !== "object") continue;
-      const count = Number(
-        item.realSeatCntlk ?? item.realSeatCnt ?? item.remainSeatCnt ?? item.seatCnt ?? 0,
-      );
+      const count = Number(itemValue(item, [
+        "realSeatCntlk",
+        "realSeatCnt",
+        "remainSeatCnt",
+        "seatCnt",
+        "seatCount",
+        "remainCnt",
+        "availableSeatCount",
+      ]) ?? 0);
       if (!Number.isFinite(count) || count <= 0) continue;
       const section = matchingSectionName(item, allowedSections);
       if (!section) continue;
-      totals.set(section, (totals.get(section) || 0) + Math.floor(count));
+      const existing = totals.find((entry) => entry.section === section);
+      if (existing) existing.count += Math.floor(count);
+      else totals.push({ section, count: Math.floor(count) });
     }
-    return [...totals.entries()]
-      .map(([section, count]) => ({ section, count }))
-      .sort((a, b) => Number(a.section.slice(1)) - Number(b.section.slice(1)));
+    return totals.sort((a, b) => Number(a.section.slice(1)) - Number(b.section.slice(1)));
   }
 
   function barkConfiguration() {
@@ -516,8 +625,9 @@
   function processSummaryResponse(rawText, source) {
     try {
       const payload = parseApiPayload(rawText);
+      lastPayloadShape = describePayloadShape(payload);
       const summary = findSummaryArray(payload);
-      if (!summary) throw new Error("响应中没有 summary 余票列表");
+      if (!summary) throw new Error(`未找到余票列表（${lastPayloadShape}）`);
       const availability = floorAvailability(summary);
       lastSeenAt = `${safeNow()} KST`;
       const signature = availability
@@ -826,6 +936,7 @@
         `Bark：${barkReady}`,
         `最近检查：${lastSeenAt}`,
         `余票捕获：${lastCaptureSource}`,
+        `响应结构：${lastPayloadShape}`,
         `已见 Melon 接口：${seenTicketApiPaths.size}`,
         `状态：${currentStatus.text} ${currentStatus.detail}`,
       ].join("\n"),
