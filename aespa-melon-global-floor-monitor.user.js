@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         aespa 8/7 Melon Global 内场回流票监控（iPad/Gear）
 // @namespace    https://chatgpt.com/
-// @version      1.1.1
+// @version      1.1.2
 // @description  iPad Gear Browser / Tampermonkey 兼容。只读监控 2026-08-07 aespa 首尔场（prodId=213414）的 F1-F16 内场回流票，并通过 Bark 提醒；不自动选座或下单。
 // @author       OpenAI
 // @homepageURL  https://github.com/Jackie888666/aespa-melon-monitor
 // @supportURL   https://github.com/Jackie888666/aespa-melon-monitor/issues
 // @updateURL    https://raw.githubusercontent.com/Jackie888666/aespa-melon-monitor/main/aespa-melon-global-floor-monitor.user.js
 // @downloadURL  https://raw.githubusercontent.com/Jackie888666/aespa-melon-monitor/main/aespa-melon-global-floor-monitor.user.js
+// @match        https://tkglobal.melon.com/performance/index.htm*
 // @match        https://tkglobal.melon.com/reservation/popup/onestop.htm*
 // @match        https://tkglobal.melon.com/reservation/popup/*
 // @run-at       document-start
@@ -55,11 +56,18 @@
   let lastAvailabilitySignature = "";
   let lastSeenAt = "尚未检查";
   let statusElement = null;
-  let currentStatus = {
-    tone: "waiting",
-    text: "等待 Melon 余票接口",
-    detail: "请正常进入 8 月 7 日场选座页",
-  };
+  const isPerformancePage = location.pathname.includes("/performance/");
+  let currentStatus = isPerformancePage
+    ? {
+        tone: "waiting",
+        text: "脚本已启动（尚未监控）",
+        detail: "请点击购票，并进入 8 月 7 日场选座页",
+      }
+    : {
+        tone: "waiting",
+        text: "等待 Melon 余票接口",
+        detail: "请正常进入 8 月 7 日场选座页",
+      };
 
   function normalizeDigits(value) {
     return String(value ?? "").replace(/\D/g, "");
