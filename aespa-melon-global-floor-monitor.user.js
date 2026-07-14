@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         aespa 8/7 Melon Global 内场回流票监控（iPad/Gear）
 // @namespace    https://chatgpt.com/
-// @version      1.1.3
-// @description  iPad Gear Browser / Tampermonkey 兼容。只读监控 2026-08-07 aespa 首尔场（prodId=213414）的 F1-F16 内场回流票，并通过 Bark 提醒；不自动选座或下单。
+// @version      1.2.0
+// @description  iPad Gear Browser / Tampermonkey 兼容。通过 Fetch、XHR、JSONP 与资源回溯只读监控 2026-08-07 aespa 首尔场（prodId=213414）的 F1-F16 内场回流票，并通过 Bark 提醒；不自动选座或下单。
 // @author       OpenAI
 // @homepageURL  https://github.com/Jackie888666/aespa-melon-monitor
 // @supportURL   https://github.com/Jackie888666/aespa-melon-monitor/issues
@@ -34,7 +34,10 @@
       "https://tkglobal.melon.com/performance/index.htm?langCd=EN&prodId=213414",
   });
 
-  const API_MARKER = "/tktapi/product/block/summary.json";
+  const SUMMARY_API_PATTERNS = Object.freeze([
+    /\/tktapi\/product\/block\/summary(?:\.json)?/i,
+    /\/tktapi\/[^?#]*(?:block|seat)[^?#]*summary/i,
+  ]);
   const DEFAULT_SECTIONS = Array.from({ length: 16 }, (_, index) => `F${index + 1}`);
   const MIN_INTERVAL_SECONDS = 20;
   const MAX_INTERVAL_SECONDS = 300;
@@ -57,6 +60,11 @@
   let lastSeenAt = "尚未检查";
   let statusElement = null;
   let quickSettingsElement = null;
+  let lastObservedSummaryUrl = "";
+  let lastCaptureSource = "尚未捕获";
+  let resourcePerformanceObserver = null;
+  let resourceMutationObserver = null;
+  const seenTicketApiPaths = new Set();
   const isPerformancePage = location.pathname.includes("/performance/");
   let currentStatus = isPerformancePage
     ? {
@@ -185,9 +193,19 @@
 
   function isSummaryApi(url) {
     try {
-      return new URL(String(url), location.href).pathname.includes(API_MARKER);
+      const parsed = new URL(String(url), location.href);
+      return SUMMARY_API_PATTERNS.some((pattern) => pattern.test(parsed.pathname));
     } catch (_error) {
-      return String(url).includes(API_MARKER);
+      return SUMMARY_API_PATTERNS.some((pattern) => pattern.test(String(url)));
+    }
+  }
+
+  function rememberTicketApiPath(url) {
+    try {
+      const parsed = new URL(String(url), location.href);
+      if (parsed.pathname.includes("/tktapi/")) seenTicketApiPaths.add(parsed.pathname);
+    } catch (_error) {
+      // A malformed resource URL is not relevant to monitoring.
     }
   }
 
@@ -244,7 +262,27 @@
   }
 
   function visiblePageText() {
-    return String(document.body?.innerText || document.documentElement?.textContent || "");
+    const documents = [document];
+    try {
+      if (pageWindow.parent?.document && pageWindow.parent.document !== document) {
+        documents.push(pageWindow.parent.document);
+      }
+    } catch (_error) {
+      // Cross-origin parent documents are intentionally ignored.
+    }
+    try {
+      if (
+        pageWindow.top?.document &&
+        !documents.includes(pageWindow.top.document)
+      ) {
+        documents.push(pageWindow.top.document);
+      }
+    } catch (_error) {
+      // Cross-origin top documents are intentionally ignored.
+    }
+    return documents
+      .map((doc) => String(doc.body?.innerText || doc.documentElement?.textContent || ""))
+      .join("\n");
   }
 
   function classifyTargetRequest(request) {
@@ -300,6 +338,34 @@
       headers: request.headers || {},
     };
     ensurePollTimer();
+    return true;
+  }
+
+  function observeResourceUrl(url, source) {
+    rememberTicketApiPath(url);
+    if (!isSummaryApi(url)) return false;
+
+    let absoluteUrl;
+    try {
+      absoluteUrl = new URL(String(url), location.href).href;
+    } catch (_error) {
+      return false;
+    }
+    if (absoluteUrl === lastObservedSummaryUrl && lastReplayableRequest) return true;
+
+    const request = {
+      url: absoluteUrl,
+      method: "GET",
+      body: null,
+      headers: {},
+    };
+    if (!rememberReplayableRequest(request)) return false;
+
+    lastObservedSummaryUrl = absoluteUrl;
+    lastCaptureSource = source;
+    setStatus("waiting", "已捕获 Melon 余票资源", `${source}｜正在读取 8/7 内场`);
+    const replaySource = source.includes("回溯") ? source : `${source}回溯`;
+    setTimeout(() => void pollOnce(replaySource), 120);
     return true;
   }
 
@@ -479,7 +545,7 @@
     }
   }
 
-  async function pollOnce() {
+  async function pollOnce(source = "定时复查") {
     if (!nativeFetch || !lastReplayableRequest || pollInFlight) return;
     pollInFlight = true;
     const request = lastReplayableRequest;
@@ -497,7 +563,7 @@
         }
         throw new Error(`Melon API HTTP ${response.status}`);
       }
-      processSummaryResponse(await response.text(), "定时复查");
+      processSummaryResponse(await response.text(), source);
     } catch (error) {
       setStatus("error", "定时复查失败", error.message);
     } finally {
@@ -519,6 +585,7 @@
       try {
         const request = snapshotFetchRequest(args[0], args[1] || {});
         if (isSummaryApi(request.url) && rememberReplayableRequest(request)) {
+          lastCaptureSource = "Fetch";
           response
             .clone()
             .text()
@@ -568,6 +635,7 @@
           () => {
             if (this.status < 200 || this.status >= 300) return;
             if (!rememberReplayableRequest(meta)) return;
+            lastCaptureSource = "XHR";
             try {
               const rawText =
                 this.responseType === "" || this.responseType === "text"
@@ -583,6 +651,94 @@
       }
       return originalSend.call(this, body);
     };
+  }
+
+  function inspectScriptResources(root, source) {
+    if (!root) return;
+    const scripts = [];
+    if (root.nodeType === 1 && String(root.tagName).toUpperCase() === "SCRIPT") {
+      scripts.push(root);
+    }
+    try {
+      scripts.push(...root.querySelectorAll("script[src]"));
+    } catch (_error) {
+      // Some transient DOM nodes cannot be queried; the performance scan remains available.
+    }
+    for (const script of scripts) {
+      const src = script.src || script.getAttribute?.("src");
+      if (src) observeResourceUrl(src, source);
+    }
+  }
+
+  function scanPerformanceResources(source) {
+    try {
+      const entries = pageWindow.performance?.getEntriesByType?.("resource") || [];
+      for (const entry of entries) {
+        if (entry?.name) observeResourceUrl(entry.name, source);
+      }
+    } catch (error) {
+      console.warn("[aespa 回流票监控] 资源记录读取失败：", error);
+    }
+  }
+
+  function installResourceObserver() {
+    const PerformanceObserverCtor = pageWindow.PerformanceObserver || globalThis.PerformanceObserver;
+    if (typeof PerformanceObserverCtor === "function") {
+      try {
+        resourcePerformanceObserver = new PerformanceObserverCtor((list) => {
+          for (const entry of list.getEntries()) {
+            if (entry?.name) observeResourceUrl(entry.name, "资源监听");
+          }
+        });
+        try {
+          resourcePerformanceObserver.observe({ type: "resource", buffered: true });
+        } catch (_error) {
+          resourcePerformanceObserver.observe({ entryTypes: ["resource"] });
+        }
+      } catch (error) {
+        resourcePerformanceObserver = null;
+        console.warn("[aespa 回流票监控] PerformanceObserver 不可用：", error);
+      }
+    }
+
+    const MutationObserverCtor = pageWindow.MutationObserver || globalThis.MutationObserver;
+    if (typeof MutationObserverCtor === "function") {
+      try {
+        resourceMutationObserver = new MutationObserverCtor((records) => {
+          for (const record of records) {
+            for (const node of record.addedNodes || []) {
+              inspectScriptResources(node, "JSONP 脚本");
+            }
+          }
+        });
+        resourceMutationObserver.observe(document, { childList: true, subtree: true });
+      } catch (error) {
+        resourceMutationObserver = null;
+        console.warn("[aespa 回流票监控] JSONP 监听不可用：", error);
+      }
+    }
+
+    inspectScriptResources(document, "现有 JSONP");
+    for (const [delay, label] of [
+      [0, "资源回溯"],
+      [500, "资源回溯"],
+      [1500, "资源回溯"],
+      [4000, "资源回溯"],
+    ]) {
+      setTimeout(() => scanPerformanceResources(label), delay);
+    }
+
+    setTimeout(() => {
+      if (lastReplayableRequest || isPerformancePage || currentStatus.tone !== "waiting") return;
+      const lastApiPath = [...seenTicketApiPaths].at(-1);
+      setStatus(
+        "waiting",
+        "等待 Melon 余票资源",
+        lastApiPath
+          ? `已看到 ${lastApiPath.split("/").at(-1)}，请点座位图右侧 Refresh`
+          : "请点击座位图右侧 Refresh 触发余票加载",
+      );
+    }, 6500);
   }
 
   function setBarkAddress() {
@@ -669,6 +825,8 @@
         `间隔：${configuredIntervalSeconds()} 秒`,
         `Bark：${barkReady}`,
         `最近检查：${lastSeenAt}`,
+        `余票捕获：${lastCaptureSource}`,
+        `已见 Melon 接口：${seenTicketApiPaths.size}`,
         `状态：${currentStatus.text} ${currentStatus.detail}`,
       ].join("\n"),
     );
@@ -758,6 +916,7 @@
 
   startStatusUi();
   registerMenus();
+  installResourceObserver();
   installFetchObserver();
   installXhrObserver();
 })();
